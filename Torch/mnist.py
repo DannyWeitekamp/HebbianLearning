@@ -57,6 +57,7 @@ for epoch in range(20):  # loop over the dataset multiple times
         Wx_, a = net.add_neuron(patches,Wx_,a)
         net.delta_W(patches,a)
         net.update_bias(a)
+        net.prune(a)
 
         # snapshot = tracemalloc.take_snapshot()
         # top_stats = snapshot.statistics('lineno')
