@@ -219,12 +219,19 @@ class HebbianLayer(nn.Module):
 
         #Get the indicies of the top filters activated for each patch
         U,U_inds = torch.topk(a, self.max_active_post_neurons,dim=1)
+
+        #ALTERNATE IMPLEMENTATION:
+        
+        print(U.size(),U_inds.size(),patches.size())
+        raise RuntimeError()
         
         #Create masks for negative and positive values in each patch 
         mask_pos = patches > 0
         mask_neg = patches < 0
 
         filter_w, filter_h = self.filter_size
+
+        
 
         #Initialize the update to the filters 
         delta = Variable(torch.zeros(W.size()),requires_grad=False,volatile=True)
