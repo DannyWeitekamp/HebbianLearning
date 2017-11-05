@@ -53,11 +53,7 @@ for epoch in range(20):  # loop over the dataset multiple times
         # forward + backward + optimize
         
         print(i)
-        patches,Wx_, a, p = net(inputs)
-        Wx_, a = net.add_neuron(patches,Wx_,a)
-        net.delta_W(patches,a)
-        net.update_bias(a)
-        net.prune(a)
+        net.AHL_update(inputs)
 
         # snapshot = tracemalloc.take_snapshot()
         # top_stats = snapshot.statistics('lineno')
