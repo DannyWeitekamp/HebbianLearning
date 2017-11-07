@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch.optim as optim
 import random,itertools
-# import tracemalloc
+
 
 try:
     xrange
@@ -16,9 +16,13 @@ except NameError:
 
 from torch.autograd import Variable
 
+#Forward Only Variable
+def FOV(tensor):
+    return Variable(tensor,requires_grad=False,volatile=True)
+
 def normalize_patches(patches):
     norm = torch.sqrt(torch.sum((patches**2),dim=1,keepdim=True))
-    is_zero = (norm == 0.0).float()
+    is_zero = (norm <= 1e-4).float()
     patches += is_zero*(1.0/np.sqrt(np.prod(norm.size()[2:])))
     norm += is_zero 
     patches = torch.div(patches,norm)
@@ -44,7 +48,11 @@ class HebbianLayer(nn.Module):
                             learning_rate=.01,
                             prune_max_corr = .8,
                             num_initial_filters=4,
-                            prune_subsamples=2500):
+                            conic_filters=True,
+                            prune_subsamples=2500,
+                            bias_avg_rate = .9,
+                            cov_avg_rate = .9,
+                            center = True):
         super(HebbianLayer, self).__init__()
         self.in_channels = in_channels
         self.add_max_corr = add_max_corr
@@ -58,6 +66,10 @@ class HebbianLayer(nn.Module):
         self.prune_max_corr = prune_max_corr
         self.patch_dimension = in_channels*int(np.prod(filter_size))
         self.prune_subsamples = prune_subsamples
+        self.conic_filters = conic_filters
+        self.bias_avg_rate = bias_avg_rate
+        self.cov_avg_rate = cov_avg_rate
+        self.center = center 
 
         self.conv = nn.Conv2d(self.patch_dimension, self.num_initial_filters, 1,stride=1,bias=False)
 
@@ -85,23 +97,31 @@ class HebbianLayer(nn.Module):
                 conv_weights = torch.rand(self.num_initial_filters,int(np.prod(self.filter_size)),1,1)
             conv_weights = normalize_patches(conv_weights)
             self.conv.weight.data = conv_weights.data
-            self.bias = Variable(torch.Tensor(self.num_initial_filters),requires_grad=False,volatile=True)
-            self.running_avg = Variable((self.average_activation)*torch.ones(self.num_initial_filters),requires_grad=False,volatile=True)
+            self.bias = FOV(torch.Tensor(self.num_initial_filters))
+            self.running_avg = FOV((self.average_activation)*torch.ones(self.num_initial_filters))
 
 
         #Initialize Covariance Matrix - to roughly zero matrix, assume small variance to prevents division by zero.
-        self.covariance_matrix = Variable(1e-2*torch.eye(self.num_initial_filters,self.num_initial_filters),requires_grad=False,volatile=True)
+        self.covariance_matrix = FOV(1e-2*torch.eye(self.num_initial_filters,self.num_initial_filters))
         # raise RuntimeError()
         self.initialized = True
         self.num_neurons = self.num_initial_filters
         
     
     def get_patches(self,x):
+
         patches = self.proj_conv(x)
+        if(self.conic_filters):
+            bias_size = list(patches.size())
+            bias_size[1] = 1 
+            # print(torch.ones(*bias_size).size())
+            patches = torch.cat([patches,.5*torch.ones(*bias_size)],dim=1)
+        # print(patches.size())   
 
         #CENTER
-        patch_mean = torch.mean(patches, dim=1, keepdim=True)
-        patches -= patch_mean
+        if(self.center):
+            patch_mean = torch.mean(patches, dim=1, keepdim=True)
+            patches -= patch_mean
 
         #TODO: WHITEN
 
@@ -124,7 +144,9 @@ class HebbianLayer(nn.Module):
 
     def AHL_update(self,inputs):
         patches,Wx_, a = self.forward(inputs,dim_order='NHWC')
+        # print("B",patches.size())
         Wx_, a = self.add_neuron(patches,Wx_,a)
+        # print("A",patches.size())
         self.update_weights(patches,a)
         self.update_bias(a)
         self.prune(a)
@@ -148,26 +170,67 @@ class HebbianLayer(nn.Module):
             expanded_bias = self.bias.view(1,-1,1,1)
         else:
             raise RuntimeError("dim_order not recognized %s only accepts 'NCHW' or 'NCHW'" % dim_order)
-
+        # expanded_bias = .7
         a = F.relu(Wx_ - expanded_bias)
 
         return patches,Wx_, a
 
-    def _new_neuron_cadidates(self,Wx_,a):
+    def _next_neuron(self,patches,Wx_,a):
         assert len(Wx_.size()) == 4
         assert len(a.size()) == 4
         
+
+
         max_Wx,_ = torch.max(Wx_,dim=-1)
         sum_a = torch.sum(a,dim=-1)
-        
+        # print(patches)
+        patches_L1 = torch.sum(torch.abs(patches),dim=-1)
+        # print(patches_L1)
         print("MIN_a: %.2f < %.2f; MIN_W: %.2f < %.2f" % (torch.min(sum_a).data[0],self.add_at_sum,torch.min(max_Wx).data[0], self.add_max_corr))
         
+        if(torch.min(sum_a).data[0] > 1000.0):
+            print(torch.max(patches,dim=0))
+            print(Wx_[0])
+            print(sum_a[0])
+            raise RuntimeError()
+
         A = (max_Wx < self.add_max_corr)
         B = (sum_a < self.add_at_sum)
-        return ((A + B) == 2).data.nonzero()
+        L = (patches_L1 > 1.5)
+        # print(patches_L1)
+        X = ((A + B + L) == 3).view(-1)
+        inds = X.data.nonzero().squeeze()
+
+        # print("DFDDF",A.view(-1)[inds],B.view(-1)[inds],L.view(-1)[inds])
+        # print("LEN",len(inds))
+        if(len(inds) > 0):
+            # print(max_Wx.view(-1)[inds])
+            _,i  = torch.min(max_Wx.view(-1)[inds],dim=0)
+            # print(i)
+            ind = inds[i.data[0]]
+            # print(ind)
+            # print("MIII",_,ind.data[0])
+
+            # print("MOOOO",max_Wx.view(-1)[ind].data[0],A.view(-1)[ind].data[0])
+
+
+            x_patch =  patches.view(-1,patches.size()[-1])[ind]
+            # print(Wx_.view(-1,self.num_neurons)[ind])
+            # print(self.conv.weight[-1][:,0,0])
+            # print(x_patch.size())
+
+            # print(patches.view(-1,patches.size()[-1])[ind].size(),ind)
+            return x_patch
+            # return ind.data[0]
+        else:
+            return None
+
+        
 
     def _add_neuron(self,x_patch):
-        self.conv.weight.data = torch.cat((self.conv.weight.data,x_patch),dim=0)
+        # print("ADDNE",self.conv.weight.size(),x_patch.size())
+        self.conv.weight.data = torch.cat((self.conv.weight,x_patch),dim=0).data
+        # print(self.conv.weight.size(),x_patch.size())
         self.bias.data = torch.cat((self.bias.data,torch.zeros(1)))
         self.running_avg = torch.cat((self.running_avg,torch.ones(1)*self.average_activation))
         cov_shape = self.covariance_matrix.size()
@@ -177,25 +240,37 @@ class HebbianLayer(nn.Module):
         self.num_neurons += 1
                 
     def add_neuron(self,patches,Wx_, a):
+        # print(a.size())
         if(not self.initialized): self.initialize()
         self._assert_NHWC(a,Wx_)
         filter_w, filter_h = self.filter_size
-        indices = self._new_neuron_cadidates(Wx_,a)
         
-        if(len(indices) > 0):
+        # print("INDS",indices)
+        permuted_patches = patches.permute(0,2,3,1)
+        permuted_patches.contiguous()
+        x_patch = self._next_neuron(permuted_patches,Wx_,a)
+        
+        # if():
             # print("Number of Candidates", indices.size()[0])
-            while(len(indices) > 0):
+        while(type(x_patch) != type(None)):
+            # print(index)
 
-                n,r,c = indices[np.random.randint(0,len(indices))]
-                x_patch = patches[n:n+1,:,r:r+1,c:c+1].data
-                
-                self._add_neuron(x_patch)
-                print("Nueron Added: %d" % self.num_neurons)
+            # n,r,c = indices[np.random.randint(0,len(indices))]
+            # print(Wx_.size(),indices.size())
+            # print(indices[-1:-10])
+            # options = Wx_.view()[indices]
+            # x_patch = permuted_patches.view(-1,permuted_patches.size()[-1])[index].data
+            # print(x_patch)
+            
+            self._add_neuron(x_patch.view(1,x_patch.size()[0],1,1))
+            # print("Nueron Added: %d" % self.num_neurons)
 
-
-                _,Wx_, a = self.forward(patches,is_patches=True,dim_order="NHWC")
-                
-                indices = self._new_neuron_cadidates(Wx_, a)
+            
+            _,Wx_, a = self.forward(patches,is_patches=True,dim_order="NHWC")
+            # print("THESE",Wx_.size(),a.size())
+            
+            x_patch = self._next_neuron(permuted_patches,Wx_, a)
+            # x_patch = None
 
         return Wx_, a
 
@@ -211,6 +286,7 @@ class HebbianLayer(nn.Module):
             self.conv.weight.data = self.conv.weight.data[to_keep]
             self.num_neurons -= len(to_remove)
 
+
     def prune(self,a):
         self._assert_NHWC(a)
         a = a.view(-1,self.num_neurons)
@@ -218,11 +294,11 @@ class HebbianLayer(nn.Module):
         new_cov = 0
         L = a.size()[0]
 
-        if(self.prune_subsamples > 0):
+        if(self.prune_subsamples > 0 and self.prune_subsamples < L):
             a = a[torch.LongTensor(np.random.choice(xrange(L), self.prune_subsamples, replace=False))]
             L = a.size()[0]
 
-        subbatch_size = 100000/(self.num_neurons**2)
+        subbatch_size = int(100000/(self.num_neurons**2))
         for i in range(0,L,subbatch_size): 
             end = min(L,i+subbatch_size)
             
@@ -231,7 +307,7 @@ class HebbianLayer(nn.Module):
             temp = torch.sum(temp,0)
             new_cov = new_cov + temp
         new_cov /= L
-        self.covariance_matrix = .95*self.covariance_matrix + .05*new_cov
+        self.covariance_matrix = self.cov_avg_rate*self.covariance_matrix + (1.0-self.cov_avg_rate)*new_cov
         
         std = torch.sqrt(torch.diag(self.covariance_matrix))
         den = std.unsqueeze(0)*std.unsqueeze(1)
@@ -240,11 +316,11 @@ class HebbianLayer(nn.Module):
         correlation_matrix = torch.triu(correlation_matrix,diagonal=1)
 
         to_remove = []
-        while(True):
+        while(self.num_neurons - len(to_remove) > max(self.max_active_post_neurons,2)): #Don't let it prune enough that it breaks
             mx,arg_mx1 = torch.max(correlation_matrix,dim=0)
             mx,arg_mx2 = torch.max(mx,dim=0)
             mx, arg_mx1,arg_mx2 = mx.data[0],arg_mx1[arg_mx2].data[0],arg_mx2.data[0]
-            print(mx,arg_mx1,arg_mx2)
+            # print(mx,arg_mx1,arg_mx2)
             assert mx == correlation_matrix[arg_mx1,arg_mx2].data[0]
             if(mx <= self.prune_max_corr):
                 break
@@ -263,33 +339,40 @@ class HebbianLayer(nn.Module):
 
 
         if(1):
-            delta = Variable(torch.zeros(W.size()[:2]),requires_grad=False,volatile=True)
+            delta = FOV(torch.zeros(W.size()[:2]))
             #Get the indicies of the top filters activated for each patch
-            print("A",a.size())
 
-            # #Put a, and patches in (total patches,number neurons) format so
-            # # we can apply the update in sub-batches to minimize cache hits
-            # a = a.permute(0,2,3,1) #size: (nn,N,ph,pw)
-            # a.contiguous()
+            #Put a, and patches in (total patches,number neurons) format so
+            # we can apply the update in sub-batches to minimize cache hits
             a = a.view(-1,self.num_neurons) #size (total patches,nn)
-
             patches = patches.permute(0,2,3,1)
             patches.contiguous()
             patches = patches.view(-1,patches.size()[-1]) #size (total patches,nn)
             # print(a.size(),patches.size())
 
             L = patches.size()[0]
-            subbatch_size = 100000/self.num_neurons
+            subbatch_size = int(100000/self.num_neurons)
             for i in range(0,L,subbatch_size): 
                 end = min(L,i+subbatch_size)
                 s = end-i
                 a_batch,patches_batch = a[i:end],patches[i:end].unsqueeze(1) #size:(subbatch_size*Kw,)
-                U,U_inds = torch.topk(a_batch, self.max_active_post_neurons,dim=1) #size:(subbatch_size*Kw,)
+                try:
+                    U,U_inds = torch.topk(a_batch, self.max_active_post_neurons,dim=1) #size:(subbatch_size*Kw,)
+                except Exception:
+                    print(a_batch.size(),self.max_active_post_neurons,self.num_neurons)
+                    raise RuntimeError("DID IT")
+
                 U_inds_flat = U_inds.view(-1) #size:(subbatch_size*Kw,)
                 
                 u_size = U_inds.size() 
+                
                 W_topk = W[U_inds_flat].view(s,self.max_active_post_neurons,-1) #size:(subbatch_size,Kw,fh*fw)
-                W_min,_ = torch.min(W_topk,dim=1,keepdim=True) #size:(subbatch_size,1,fh*fw)
+                
+                
+                #Memory leak in version 2.0 of pytorch for torch.min, replace with max
+                W_min,_ = torch.max(torch.neg(W_topk),dim=1,keepdim=True) #size:(subbatch_size,1,fh*fw)
+                W_min = torch.neg(W_min)
+                # W_min,_ = torch.min(W_topk,dim=1,keepdim=True) #size:(subbatch_size,1,fh*fw)
                 W_max,_ = torch.max(W_topk,dim=1,keepdim=True) #size:(subbatch_size,1,fh*fw)
                                 
                 p_mask = (patches_batch > 0) #size:(subbatch_size,1,fh*fw)
@@ -299,8 +382,13 @@ class HebbianLayer(nn.Module):
                 mask = (p_mask * w_mask_p + n_mask*w_mask_n) > 0 #size:(subbatch_size,Kw,fh*fw)
 
                 masked_additions = patches_batch*mask.float()
+                # print(W_topk.size(),patches_batch.size(),masked_additions.size())
+                y = W_topk*masked_additions
 
-                delta.index_add_(0,U_inds_flat,masked_additions.view(-1,masked_additions.size()[-1]))
+                masked_additions = masked_additions - y
+
+                to_add = masked_additions.view(-1,masked_additions.size()[-1])
+                delta.index_add_(0,U_inds_flat,to_add)
 
             delta = delta.view(delta.size()[0],delta.size()[1],1,1)
             
@@ -324,7 +412,7 @@ class HebbianLayer(nn.Module):
             
 
             #Initialize the update to the filters 
-            delta = Variable(torch.zeros(W.size()),requires_grad=False,volatile=True)
+            delta = FOV(torch.zeros(W.size()))
             act_width,act_height = U_inds.size()[2:]
 
             #Loop through post synaptic activations
@@ -354,12 +442,15 @@ class HebbianLayer(nn.Module):
                         delta.index_add_(0, inds, t)
                     
         #Apply the update
-        self.conv.weight.data += .001* delta.data
+        self.conv.weight.data += .01* delta.data
 
         #Normalize each filter
         last = W.size()[1:]
         as_lin_trans = self.conv.weight.squeeze()
-        self.conv.weight.data = F.normalize(as_lin_trans,dim=1).view(-1,*last).data
+        try:
+            self.conv.weight.data = F.normalize(as_lin_trans,dim=1).view(-1,*last).data
+        except Exception:
+            print(as_lin_trans.size(),self.num_neurons)
         
         return delta
 
@@ -369,7 +460,7 @@ class HebbianLayer(nn.Module):
         self._assert_NHWC(a)
         if(not self.initialized): self.initialize()
         current = torch.mean(torch.mean(torch.mean(torch.sign(a),dim=0),dim=0),dim=0)
-        self.running_avg = 0.95*self.running_avg + .05*current        
-        self.bias += .05*(self.running_avg - self.average_activation)
+        self.running_avg = self.bias_avg_rate*self.running_avg + (1.0-self.bias_avg_rate)*current        
+        self.bias += (1.0-self.bias_avg_rate)*(self.running_avg - self.average_activation)
 
 
